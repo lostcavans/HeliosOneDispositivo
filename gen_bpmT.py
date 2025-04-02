@@ -3,95 +3,206 @@ import numpy as np
 import threading
 import time
 from datetime import datetime, timedelta
-import random  # Para generar probabilidades
+import random
+import math
 
-# --- Parámetros ---
-id_user = 50  # ID del usuario
-evento_activado = None  # Evento activado (estrés, fatiga, hipoxia)
-fin_evento = None  # Hora de finalización del evento
-tiempo_sin_riesgo = None  # Hora para iniciar un nuevo evento
-ultimo_evento = None  # Hora del último evento
+# --- Configuración realista ---
+CONFIG = {
+    "id_user": 50,
+    "db_config": {
+        "host": "localhost",
+        "user": "root",
+        "password": "",
+        "database": "bd_helios"
+    },
+    "intervalo_muestreo": 15,  # segundos entre mediciones
+    "probabilidad_evento": 0.05,  # 5% de chance de evento por chequeo
+    "duracion_evento": timedelta(minutes=10),  # Duración típica de un evento
+    "periodo_minimo_normal": timedelta(minutes=30),  # Tiempo mínimo entre eventos
+    "valores_normales": {
+        "bpm": (60, 100),
+        "spo2": (95, 100)
+    },
+    "eventos": {
+        "estres": {
+            "nombre": "⚠️ Estrés cardíaco extremo",
+            "bpm": (140, 180),
+            "spo2": (90, 100),
+            "probabilidad": 0.4  # 40% de los eventos
+        },
+        "fatiga": {
+            "nombre": "⚠️ Fatiga extrema o hipotermia",
+            "bpm": (50, 70),
+            "spo2": (85, 95),
+            "probabilidad": 0.3  # 30% de los eventos
+        },
+        "hipoxia": {
+            "nombre": "⚠️ Hipoxia o intoxicación por humo",
+            "bpm": (70, 110),
+            "spo2": (75, 85),
+            "probabilidad": 0.3  # 30% de los eventos
+        }
+    }
+}
 
-# --- Conectar a la base de datos ---
-def conectar_db():
-    return pymysql.connect(
-        host='localhost',
-        user='root',
-        password='',
-        database='bd_helios'
-    )
+class SimuladorSignosVitales:
+    def __init__(self):
+        self.evento_actual = None
+        self.inicio_evento = None
+        self.fin_evento = None
+        self.ultimo_evento = None
+        self.transicion_activa = False
+        self.proximo_evento_posible = datetime.now()
 
-# --- Función para simular la evolución de los eventos ---
-def simular_evento(evento):
-    if evento == "⚠️ Estrés cardíaco extremo":
-        return round(np.random.uniform(140, 180), 2), round(np.random.uniform(90, 100), 2)
-    elif evento == "⚠️ Fatiga extrema o hipotermia":
-        return round(np.random.uniform(50, 70), 2), round(np.random.uniform(85, 95), 2)
-    elif evento == "⚠️ Hipoxia o intoxicación por humo":
-        return round(np.random.uniform(70, 110), 2), round(np.random.uniform(75, 85), 2)
-    return round(np.random.uniform(60, 100), 2), round(np.random.uniform(95, 100), 2)
-
-# --- Función para generar datos en tiempo real ---
-def generar_datos():
-    global evento_activado, fin_evento, tiempo_sin_riesgo, ultimo_evento
-    while True:
-        now = datetime.now()
-
-        # Si un evento está activo y ya pasó el tiempo, lo desactiva
-        if evento_activado and now >= fin_evento:
-            print(f"✅ Evento finalizado: {evento_activado}. Iniciando periodo sin riesgo.")
-            evento_activado = None
-            tiempo_sin_riesgo = now + timedelta(seconds=600)  # 30 segundos sin riesgo
-
-        # Si hay tiempo sin riesgo
-        if tiempo_sin_riesgo and now >= tiempo_sin_riesgo:
-            print("✅ Sin riesgo")
-            tiempo_sin_riesgo = None  # Reiniciar el tiempo sin riesgo
-
-        # Determinar valores de BPM y SpO2
-        if evento_activado:
-            bpm, spo2 = simular_evento(evento_activado)
-        else:
-            bpm, spo2 = simular_evento("✅ Sin riesgo")
-
-        # Generar un evento si no hay uno activo y ha pasado suficiente tiempo
-        if evento_activado is None and (not ultimo_evento or now - ultimo_evento >= timedelta(minutes=2)):
-            probabilidad_evento = random.random()
-
-            if probabilidad_evento < 0.10:
-                evento_activado = "⚠️ Estrés cardíaco extremo"
-            elif probabilidad_evento < 0.20:
-                evento_activado = "⚠️ Fatiga extrema o hipotermia"
-            elif probabilidad_evento < 0.30:
-                evento_activado = "⚠️ Hipoxia o intoxicación por humo"
-
-            if evento_activado:
-                fin_evento = now + timedelta(minutes=2)
-                ultimo_evento = now
-                print(f"🔥 Evento iniciado: {evento_activado}")
-
-        # Insertar en la base de datos
+    def conectar_db(self):
+        """Conexión a la base de datos"""
         try:
-            conn = conectar_db()
-            cursor = conn.cursor()
-            query = "INSERT INTO bpm_data (id_user, bpm, SPo2, estado, timestamp) VALUES (%s, %s, %s, %s, %s)"
-            estado_actual = evento_activado if evento_activado else "✅ Sin riesgo"
-            cursor.execute(query, (id_user, bpm, spo2, estado_actual, now))
-            conn.commit()
-            cursor.close()
-            conn.close()
-            print(f"{estado_actual} - BPM: {bpm}, SpO2: {spo2}, Hora: {now}")
+            return pymysql.connect(**CONFIG['db_config'])
+        except Exception as e:
+            print(f"❌ Error de conexión a DB: {e}")
+            return None
+
+    def generar_valor_suavizado(self, base, variacion_normal=5):
+        """Genera valores con variación suave"""
+        return base + random.uniform(-variacion_normal, variacion_normal)
+
+    def simular_signos(self):
+        """Genera valores de BPM y SpO2 según el estado actual"""
+        now = datetime.now()
+        
+        # Estado normal
+        if not self.evento_actual:
+            bpm = self.generar_valor_suavizado(80)
+            spo2 = self.generar_valor_suavizado(98, 2)
+            return bpm, spo2, "✅ Sin riesgo"
+        
+        # Durante evento
+        tiempo_transcurrido = (now - self.inicio_evento).total_seconds()
+        duracion_total = (self.fin_evento - self.inicio_evento).total_seconds()
+        progreso = min(tiempo_transcurrido / duracion_total, 1.0)
+        
+        # Valores base del evento
+        if "estres" in self.evento_actual:
+            bpm_base = 160
+            spo2_base = 95
+        elif "fatiga" in self.evento_actual:
+            bpm_base = 60
+            spo2_base = 90
+        else:  # hipoxia
+            bpm_base = 90
+            spo2_base = 80
+        
+        # Suavizar transición
+        if progreso < 0.2:  # Inicio del evento
+            factor = progreso / 0.2
+            bpm = 80 + (bpm_base - 80) * factor
+            spo2 = 98 + (spo2_base - 98) * factor
+        elif progreso > 0.8:  # Final del evento
+            factor = (progreso - 0.8) / 0.2
+            bpm = bpm_base + (80 - bpm_base) * factor
+            spo2 = spo2_base + (98 - spo2_base) * factor
+        else:  # Pico del evento
+            bpm = bpm_base + math.sin(progreso * math.pi * 4) * 10
+            spo2 = spo2_base + math.sin(progreso * math.pi * 4) * 3
+        
+        return bpm, spo2, self.evento_actual
+
+    def evaluar_evento(self):
+        """Determina si debe comenzar un nuevo evento"""
+        now = datetime.now()
+        
+        # No iniciar nuevo evento si ya hay uno activo o no ha pasado el tiempo mínimo
+        if self.evento_actual or now < self.proximo_evento_posible:
+            return False
+        
+        # Chequear probabilidad de evento
+        if random.random() > CONFIG['probabilidad_evento']:
+            return False
+        
+        # Seleccionar tipo de evento
+        r = random.random()
+        acumulado = 0
+        for evento in CONFIG['eventos'].values():
+            acumulado += evento['probabilidad']
+            if r <= acumulado:
+                self.evento_actual = evento['nombre']
+                self.inicio_evento = now
+                self.fin_evento = now + CONFIG['duracion_evento']
+                self.ultimo_evento = now
+                self.proximo_evento_posible = now + CONFIG['periodo_minimo_normal']
+                print(f"🚨 Iniciando evento: {self.evento_actual}")
+                return True
+        return False
+
+    def finalizar_evento(self):
+        """Finaliza el evento actual"""
+        print(f"✅ Finalizando evento: {self.evento_actual}")
+        self.evento_actual = None
+        self.inicio_evento = None
+        self.fin_evento = None
+
+    def insertar_datos(self, bpm, spo2, estado):
+        """Guarda los datos en la base de datos"""
+        try:
+            conn = self.conectar_db()
+            if not conn:
+                return
+                
+            with conn.cursor() as cursor:
+                query = """
+                    INSERT INTO bpm_data 
+                    (id_user, bpm, SPo2, estado, timestamp) 
+                    VALUES (%s, %s, %s, %s, %s)
+                """
+                cursor.execute(query, (
+                    CONFIG['id_user'],
+                    round(bpm, 2),
+                    round(spo2, 2),
+                    estado,
+                    datetime.now()
+                ))
+                conn.commit()
+                print(f"📊 {estado} - BPM: {round(bpm)}, SpO2: {round(spo2)}")
         except Exception as e:
             print(f"❌ Error al insertar datos: {e}")
+        finally:
+            if conn:
+                conn.close()
 
-        # Esperar 10 segundos antes de la próxima medición
-        time.sleep(15)
+    def ejecutar_ciclo(self):
+        """Ejecuta un ciclo completo de simulación"""
+        now = datetime.now()
+        
+        # Verificar si debe finalizar un evento
+        if self.evento_actual and now >= self.fin_evento:
+            self.finalizar_evento()
+        
+        # Evaluar inicio de nuevo evento
+        self.evaluar_evento()
+        
+        # Generar y guardar datos
+        bpm, spo2, estado = self.simular_signos()
+        self.insertar_datos(bpm, spo2, estado)
 
-# --- Iniciar la simulación en un hilo separado ---
-hilo = threading.Thread(target=generar_datos)
-hilo.daemon = True
-hilo.start()
+    def iniciar_simulacion(self):
+        """Inicia la simulación en tiempo real"""
+        print("🚀 Iniciando simulador de signos vitales - Modo Realista")
+        print(f"⏱  Intervalo de muestreo: {CONFIG['intervalo_muestreo']} segundos")
+        
+        while True:
+            self.ejecutar_ciclo()
+            time.sleep(CONFIG['intervalo_muestreo'])
 
-# Mantener el script corriendo
-while True:
-    time.sleep(1)
+# --- Iniciar la simulación ---
+if __name__ == "__main__":
+    simulador = SimuladorSignosVitales()
+    hilo = threading.Thread(target=simulador.iniciar_simulacion)
+    hilo.daemon = True
+    hilo.start()
+    
+    # Mantener el script principal ejecutándose
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n🔴 Simulación detenida")
